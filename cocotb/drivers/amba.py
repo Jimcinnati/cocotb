@@ -369,3 +369,187 @@ class AXI4Slave(BusDriver):
                 self.bus.RLAST <= 0
                 if burst_count == 0:
                     break
+
+class AXI4LiteSlave(BusDriver):
+    """
+    AXI4-Lite Slave
+
+    TODO: Kill all pending transactions if reset is asserted...
+    """
+    _signals = ["AWVALID", "AWADDR", "AWREADY", "AWPROT",   # Write address channel
+                "WVALID", "WREADY", "WDATA", "WSTRB",       # Write data channel
+                "BVALID", "BREADY", "BRESP",                # Write response channel
+                "ARVALID", "ARADDR", "ARREADY", "ARPROT",   # Read address channel
+                "RVALID", "RREADY", "RRESP", "RDATA"]       # Read data channel
+
+    def __init__(self, entity, name, clock, memory, big_endian=False, 
+                 array_idx=None, sync=True):
+        BusDriver.__init__(self, entity, name, clock, array_idx=array_idx)
+        self.clock = clock
+        self.big_endian = big_endian
+        self.memory = memory
+        self.data_width = len(self.bus.WDATA.value)
+        self.bytes_per_beat = int(self.data_width / 8)
+        self._sync = sync
+        
+        # Default BRESP and RRESP to OKAY
+        self.bresp = 0x0
+        self.rresp = 0x0
+        
+        if not(self.data_width in [32,64]):
+            raise ValueError("Bus data width of %d is not valid. AXI4-Lite"
+                             "protocol only supports bit widths of 32 or 64" %
+                             (self.data_width))
+        
+        # Variables to keep track of AXI4L request addresses. These values are
+        # set when a valid address is received and revert back to 'None' once 
+        # the transaction completes.
+        self._awaddr = None
+        self._awprot = None
+        self._araddr = None
+        
+        # Initialize control signals driven by slave bus
+        self.bus.AWREADY.setimmediatevalue(1)
+        self.bus.WREADY.setimmediatevalue(1)
+        self.bus.BVALID.setimmediatevalue(0)
+        self.bus.ARREADY.setimmediatevalue(1)
+        self.bus.RVALID.setimmediatevalue(0)
+        
+        # Mutex for each channel that we master to prevent contention
+        self.write_response_busy = Lock("%s_bbusy" % name)
+        self.read_response_busy = Lock("%s_rbusy" % name)
+        
+        # Run coroutines for monitoring request channels.
+        cocotb.fork(self._write_address())
+        cocotb.fork(self._write_data())
+        cocotb.fork(self._read_data())
+    
+    def setWrResponse(self, bresp):
+        if not(bresp in range(0,4)):
+            raise ValueError("Valid BRESP values range from 0b00 to 0b11")
+        self.bresp = bresp
+    
+    def setRdResponse(self, rresp):
+        if not(rresp in range(0,4)):
+            raise ValueError("Valid RRESP values range from 0b00 to 0b11")
+        self.rresp = rresp
+    
+    @cocotb.coroutine
+    def _write_address(self):
+        while True:
+            self.bus.AWREADY <= 1
+            if self._sync:
+                yield RisingEdge(self.clock)
+            
+            # If write address has been consumed:
+            if (self.bus.AWVALID.value):
+                self.bus.AWREADY <= 0
+                self._awaddr = int(self.bus.AWADDR)
+                self._awprot = int(self.bus.AWPROT)
+                if self._sync:
+                    yield RisingEdge(self.clock)
+                
+                # Wait until transaction has been completed and self._awaddr is 
+                # set to None
+                while self._awaddr:
+                    if self._sync:
+                        yield RisingEdge(self.clock)
+                    
+    @cocotb.coroutine
+    def _write_data(self):
+        while True:
+        
+            _wdata = None
+            _wstrb = None
+        
+            self.bus.WREADY <= 1
+            if self._sync:
+                yield RisingEdge(self.clock)
+            
+            # If write data has been consumed:
+            if (self.bus.WVALID.value):
+                self.bus.WREADY <= 0
+                _wdata = int(self.bus.WDATA)
+                _bytes_per_beat = int(len(self.bus.WDATA.value)/8)
+                _wstrb = str(self.bus.WSTRB.value)
+                
+                if self._sync:
+                    yield RisingEdge(self.clock)
+                
+                # Wait for a valid address before completing the write transaction
+                while (self._awaddr == None):
+                    if self._sync:
+                        yield RisingEdge(self.clock)
+                
+                # Get byte indices based on endianness
+                _pack_str = 'I' if self.bytes_per_beat == 4 else 'Q'
+                _pack_str = '>'+_pack_str if self.big_endian else '<'+_pack_str
+                
+                _data = struct.pack(_pack_str, int(_wdata))
+                
+                # Write data byte to memory if corresponding wstrb bit is set
+                for idx,value in enumerate(_data):
+                    if bool(_wstrb[idx]):
+                        self.memory[self._awaddr+idx] = value
+                
+                # Generate response
+                self.bus.BRESP <= self.bresp
+                self.bus.BVALID <= 1
+                while True:
+                    if self._sync:
+                        yield RisingEdge(self.clock)
+                    if (self.bus.BREADY.value):
+                        break
+                
+                if __debug__:
+                    self.log.debug(
+                        "AWADDR         = 0x{0:08x}\n".format(self._awaddr) +
+                        "AWPROT         = 0b{0:03b}\n".format(self._awprot) +
+                        "WDATA          = 0x{0:08x}\n".format(_wdata) +
+                        "WSTRB          = 0x{0:04x}\n".format(int(_wstrb,2)) +
+                        "Bytes in beat  = {0:}\n".format(self.bytes_per_beat) +
+                        "BRESP          = 0b{0:02b}\n\n".format(self.bresp))
+                
+                self.bus.BVALID <= 0
+                
+                # Write is complete, reset address to None
+                self._awaddr = None
+                self._awprot = None
+        
+    @cocotb.coroutine
+    def _read_data(self):
+        while True:
+            self.bus.ARREADY <= 1
+            if self._sync:
+                yield RisingEdge(self.clock)
+            
+            if (self.bus.ARVALID.value):
+                self.bus.ARREADY <= 0
+                _araddr = int(self.bus.ARADDR)
+                _arprot = int(self.bus.ARPROT)
+                
+                # Get byte indices based on endianness
+                _unpack_str = 'I' if self.bytes_per_beat == 4 else 'Q'
+                _unpack_str = '>'+_unpack_str if self.big_endian else '<'+_unpack_str
+
+                _data = struct.unpack(_unpack_str, bytes(self.memory[_araddr:_araddr+self.bytes_per_beat]))
+                
+                self.bus.RDATA <= _data[0]
+                self.bus.RRESP <= self.rresp
+                self.bus.RVALID <= 1
+                
+                while True:
+                    if self._sync:
+                        yield RisingEdge(self.clock)
+                    if (self.bus.RREADY.value):
+                        break
+                
+                if __debug__:
+                    self.log.debug(
+                        "ARADDR         = 0x{0:08x}\n".format(_araddr) +
+                        "ARPROT         = 0b{0:03b}\n".format(_arprot) +
+                        "RDATA          = 0x{0:08x}\n".format(_data[0]) +
+                        "Bytes in beat  = {0:}\n".format(self.bytes_per_beat) +
+                        "RRESP          = 0b{0:02b}\n\n".format(self.rresp))
+                
+                self.bus.ARREADY <= 1
